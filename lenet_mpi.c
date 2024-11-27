@@ -489,8 +489,6 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &world_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &world_size);
 
-    double program_start = MPI_Wtime();
-
     // Verify minimum number of processes
     if (world_size < 2) {
         if (world_rank == 0) {
@@ -514,7 +512,7 @@ int main(int argc, char** argv) {
     // Root process reads input
     if (world_rank == 0) {
         printf("Reading input image...\n");
-        input = read_image("test_images/synthetic_digit_0_1.raw");
+        input = read_image("test_images/digit_6.raw");
         if (!input) {
             printf("Failed to read input image\n");
             MPI_Abort(MPI_COMM_WORLD, 1);
@@ -555,9 +553,6 @@ int main(int argc, char** argv) {
             printf("Digit %d: %.2f%%\n", i, output[i] * 100);
         }
 
-        double program_end = MPI_Wtime();
-        printf("\nTotal program execution time: %.7f seconds\n", 
-               program_end - program_start);
     }
 
     // Cleanup
