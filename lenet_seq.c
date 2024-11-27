@@ -271,7 +271,7 @@ void forward(float* input, float* output, NetworkWeights* weights) {
                 conv1_output, CONV1_OUTPUT, CONV1_OUTPUT);
     end = clock();
     cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("Conv1 layer time: %.4f seconds\n", cpu_time_used);
+    printf("Conv1 layer time: %.7f seconds\n", cpu_time_used);
 
     // Pool1 layer
     start = clock();
@@ -279,7 +279,7 @@ void forward(float* input, float* output, NetworkWeights* weights) {
                 POOL1_SIZE, pool1_output, POOL1_OUTPUT, POOL1_OUTPUT);
     end = clock();
     cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("Pool1 layer time: %.4f seconds\n", cpu_time_used);
+    printf("Pool1 layer time: %.7f seconds\n", cpu_time_used);
 
     // Conv2 layer
     start = clock();
@@ -289,7 +289,7 @@ void forward(float* input, float* output, NetworkWeights* weights) {
                 conv2_output, CONV2_OUTPUT, CONV2_OUTPUT);
     end = clock();
     cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("Conv2 layer time: %.4f seconds\n", cpu_time_used);
+    printf("Conv2 layer time: %.7f seconds\n", cpu_time_used);
 
     // Pool2 layer
     start = clock();
@@ -297,7 +297,7 @@ void forward(float* input, float* output, NetworkWeights* weights) {
                 POOL2_SIZE, pool2_output, POOL2_OUTPUT, POOL2_OUTPUT);
     end = clock();
     cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("Pool2 layer time: %.4f seconds\n", cpu_time_used);
+    printf("Pool2 layer time: %.7f seconds\n", cpu_time_used);
 
     // Conv3 layer
     start = clock();
@@ -307,7 +307,7 @@ void forward(float* input, float* output, NetworkWeights* weights) {
                 conv3_output, CONV3_OUTPUT, CONV3_OUTPUT);
     end = clock();
     cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("Conv3 layer time: %.4f seconds\n", cpu_time_used);
+    printf("Conv3 layer time: %.7f seconds\n", cpu_time_used);
 
     // FC1 layer
     start = clock();
@@ -315,7 +315,7 @@ void forward(float* input, float* output, NetworkWeights* weights) {
           CONV3_FILTERS, FC1_SIZE, fc1_output, 0);
     end = clock();
     cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("FC1 layer time: %.4f seconds\n", cpu_time_used);
+    printf("FC1 layer time: %.7f seconds\n", cpu_time_used);
 
     // FC2 layer (output)
     start = clock();
@@ -323,12 +323,12 @@ void forward(float* input, float* output, NetworkWeights* weights) {
           FC1_SIZE, OUTPUT_SIZE, output, 1);
     end = clock();
     cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("FC2 layer time: %.4f seconds\n", cpu_time_used);
+    printf("FC2 layer time: %.7f seconds\n", cpu_time_used);
 
     // Total time
     clock_t end_total = clock();
     double total_time = ((double) (end_total - start_total)) / CLOCKS_PER_SEC;
-    printf("\nTotal execution time: %.4f seconds\n", total_time);
+    printf("\nTotal execution time: %.7f seconds\n", total_time);
 
     // Free intermediate results
     free(conv1_output);
@@ -369,7 +369,7 @@ int main() {
     NetworkWeights weights = init_network();
 
     // Read input image
-    float* input = read_image("test_images/digit_7.raw");
+    float* input = read_image("test_images/synthetic_digit_0_1.raw");
     if (!input) {
         printf("Failed to read input image\n");
         free_network(&weights);
