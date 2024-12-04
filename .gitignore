@@ -1,0 +1,9 @@
+---
+```plaintext
+# Ignore compiled output files and intermediate files
+lenet_seq
+lenet_mpi
+lenet_openmp
+lenet_cuda
+*.o
+*.out

@@ -328,7 +328,7 @@ void forward(float* input, float* output, NetworkWeights* weights) {
     // Total time
     clock_t end_total = clock();
     double total_time = ((double) (end_total - start_total)) / CLOCKS_PER_SEC;
-    printf("\nTotal execution time: %.7f seconds\n", total_time);
+    printf("\nTotal network execution time: %.7f seconds\n", total_time);
 
     // Free intermediate results
     free(conv1_output);

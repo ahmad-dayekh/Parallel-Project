@@ -99,7 +99,7 @@ float tanh_activate(float x) {
 void convolution(float* input, int input_width, int input_height, int input_channels,
                  float* weights, float* bias, int kernel_size, int num_filters,
                  float* output, int output_width, int output_height) {
-    #pragma omp parallel for collapse(3) schedule(guided)
+    #pragma omp parallel for collapse(3) schedule(static)
     for (int f = 0; f < num_filters; f++) {
         for (int i = 0; i < output_height; i++) {
             for (int j = 0; j < output_width; j++) {
@@ -130,7 +130,7 @@ void avg_pooling(float* input, int input_width, int input_height, int num_channe
                  int pool_size, float* output, int output_width, int output_height) {
     float scale = 1.0f / (pool_size * pool_size);
 
-    #pragma omp parallel for collapse(3) schedule(guided)
+    #pragma omp parallel for collapse(3) schedule(static)
     for (int c = 0; c < num_channels; c++) {
         for (int i = 0; i < output_height; i++) {
             for (int j = 0; j < output_width; j++) {
@@ -172,7 +172,7 @@ void softmax(float* input, int size) {
 
 void dense(float* input, float* weights, float* bias,
            int input_size, int output_size, float* output, int is_output) {
-    #pragma omp parallel for schedule(guided)
+    #pragma omp parallel for schedule(static)
     for (int i = 0; i < output_size; i++) {
         float sum = 0.0f;
         #pragma omp simd reduction(+:sum)
@@ -344,9 +344,6 @@ int main(int argc, char *argv[]) {
     omp_set_dynamic(0);     // Disable dynamic teams
     omp_set_nested(0);      // Disable nested parallelism
     omp_set_num_threads(num_threads);
-
-    printf("Running with %d OpenMP threads\n", num_threads);
-    printf("Maximum available threads: %d\n", omp_get_max_threads());
 
     // Initialize network
     NetworkWeights weights = init_network();

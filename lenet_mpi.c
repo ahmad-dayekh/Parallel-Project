@@ -54,25 +54,25 @@ typedef struct {
 float* load_weights(const char* filename, int size) {
     float* weights = (float*)malloc(size * sizeof(float));
     if (!weights) {
-        printf("Failed to allocate memory for weights\n");
-        exit(1);
+        printf("Rank %d: Failed to allocate memory for weights\n", world_rank);
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
     char filepath[256];
     snprintf(filepath, sizeof(filepath), "weights/%s", filename);
     FILE* fp = fopen(filepath, "r");
     if (!fp) {
-        printf("Error opening file: %s\n", filepath);
+        printf("Rank %d: Error opening file: %s\n", world_rank, filepath);
         free(weights);
-        exit(1);
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
     for (int i = 0; i < size; i++) {
         if (fscanf(fp, "%f", &weights[i]) != 1) {
-            printf("Error reading weight at index %d from %s\n", i, filepath);
+            printf("Rank %d: Error reading weight at index %d from %s\n", world_rank, i, filepath);
             fclose(fp);
             free(weights);
-            exit(1);
+            MPI_Abort(MPI_COMM_WORLD, 1);
         }
     }
 
@@ -82,7 +82,7 @@ float* load_weights(const char* filename, int size) {
 
 // Rearrange convolutional weights
 void rearrange_conv_weights(float* weights_in, float* weights_out,
-                          int kernel_size, int input_channels, int output_channels) {
+                           int kernel_size, int input_channels, int output_channels) {
     for (int o = 0; o < output_channels; o++) {
         for (int i = 0; i < input_channels; i++) {
             for (int kh = 0; kh < kernel_size; kh++) {
@@ -105,33 +105,28 @@ float tanh_activate(float x) {
     return tanh(x);
 }
 
-// Parallel convolution operation with MPI and timing
+// Parallel convolution operation with MPI
 void convolution_mpi(float* input, int input_width, int input_height, int input_channels,
                     float* weights, float* bias, int kernel_size, int num_filters,
                     float* output, int output_width, int output_height) {
-    
-    double conv_start = MPI_Wtime();
-    
-    // Calculate work distribution
-    int filters_per_process = (num_filters + world_size - 1) / world_size;  // Round up division
-    int start_filter = world_rank * filters_per_process;
-    int end_filter = start_filter + filters_per_process;
-    if (end_filter > num_filters) end_filter = num_filters;
-    int local_num_filters = end_filter - start_filter;
 
-    // Calculate buffer sizes
-    int local_output_size = local_num_filters * output_width * output_height;
-    int max_local_output_size = filters_per_process * output_width * output_height;
+    // Updated work distribution
+    int filters_per_process = num_filters / world_size + (world_rank < (num_filters % world_size) ? 1 : 0);
+    int start_filter = (world_rank * (num_filters / world_size)) + 
+                       (world_rank < (num_filters % world_size) ? world_rank : (num_filters % world_size));
+    int local_num_filters = filters_per_process;
 
-    // Allocate local output buffer
-    float* local_output = (float*)calloc(local_output_size, sizeof(float));
-    if (!local_output) {
-        printf("Rank %d: Failed to allocate local output buffer\n", world_rank);
-        MPI_Abort(MPI_COMM_WORLD, 1);
-        return;
+    // Allocate local output buffer only if there are filters to process
+    float* local_output = NULL;
+    if (local_num_filters > 0) {
+        local_output = (float*)calloc(local_num_filters * output_width * output_height, sizeof(float));
+        if (!local_output) {
+            printf("Rank %d: Failed to allocate local output buffer\n", world_rank);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
     }
 
-    // Perform convolution for assigned filters
+    // Perform convolution only if there are filters assigned
     for (int f = 0; f < local_num_filters; f++) {
         int global_f = start_filter + f;
         for (int i = 0; i < output_height; i++) {
@@ -143,55 +138,81 @@ void convolution_mpi(float* input, int input_width, int input_height, int input_
                             int in_i = i + ki;
                             int in_j = j + kj;
                             int input_idx = c * input_height * input_width +
-                                          in_i * input_width + in_j;
+                                            in_i * input_width + in_j;
                             int weight_idx = global_f * input_channels * kernel_size * kernel_size +
-                                           c * kernel_size * kernel_size +
-                                           ki * kernel_size + kj;
+                                             c * kernel_size * kernel_size +
+                                             ki * kernel_size + kj;
                             sum += input[input_idx] * weights[weight_idx];
                         }
                     }
                 }
                 sum += bias[global_f];
-                local_output[f * output_height * output_width + 
-                           i * output_width + j] = tanh_activate(sum);
+                local_output[f * output_height * output_width +
+                            i * output_width + j] = tanh_activate(sum);
             }
         }
     }
 
-    // Gather results from all processes
-    MPI_Barrier(MPI_COMM_WORLD);
+    // Prepare for gathering
+    int* recvcounts = NULL;
+    int* displs = NULL;
 
-    int* recvcounts = (int*)malloc(world_size * sizeof(int));
-    int* displs = (int*)malloc(world_size * sizeof(int));
-    
-    // Calculate receive counts and displacements
-    for (int i = 0; i < world_size; i++) {
-        int start = i * filters_per_process;
-        int end = start + filters_per_process;
-        if (end > num_filters) end = num_filters;
-        recvcounts[i] = (end - start) * output_width * output_height;
-        displs[i] = start * output_width * output_height;
-    }
-
-    MPI_Allgatherv(local_output, local_output_size, MPI_FLOAT,
-                   output, recvcounts, displs, MPI_FLOAT, MPI_COMM_WORLD);
-
-    double conv_end = MPI_Wtime();
     if (world_rank == 0) {
-        printf("Convolution time: %.7f seconds\n", conv_end - conv_start);
+        recvcounts = (int*)malloc(world_size * sizeof(int));
+        displs = (int*)malloc(world_size * sizeof(int));
+        if (!recvcounts || !displs) {
+            printf("Rank %d: Failed to allocate recvcounts or displs\n", world_rank);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        int displacement = 0;
+        for (int i = 0; i < world_size; i++) {
+            int proc_filters = num_filters / world_size + (i < (num_filters % world_size) ? 1 : 0);
+            recvcounts[i] = proc_filters * output_width * output_height;
+            displs[i] = displacement;
+            displacement += recvcounts[i];
+        }
     }
 
-    free(local_output);
-    free(recvcounts);
-    free(displs);
+    // Gather all local outputs to the root process
+    MPI_Gatherv(local_output, (local_num_filters > 0) ? local_num_filters * output_width * output_height : 0, 
+                MPI_FLOAT,
+                (world_rank == 0) ? output : NULL, recvcounts, displs, MPI_FLOAT,
+                0, MPI_COMM_WORLD);
+
+    // Free allocated memory
+    if (local_output) free(local_output);
+    if (world_rank == 0) {
+        free(recvcounts);
+        free(displs);
+    }
 }
-// Average pooling operation with timing
-void avg_pooling(float* input, int input_width, int input_height, int num_channels,
+
+// Parallel average pooling operation with MPI
+void pooling_mpi(float* input, int input_width, int input_height, int num_channels,
                 int pool_size, float* output, int output_width, int output_height) {
-    double pool_start = MPI_Wtime();
+
+    // Updated work distribution
+    int channels_per_process = num_channels / world_size + (world_rank < (num_channels % world_size) ? 1 : 0);
+    int start_channel = (world_rank * (num_channels / world_size)) + 
+                        (world_rank < (num_channels % world_size) ? world_rank : (num_channels % world_size));
+    int local_num_channels = channels_per_process;
+
+    // Allocate local output buffer only if there are channels to process
+    float* local_output = NULL;
+    if (local_num_channels > 0) {
+        local_output = (float*)calloc(local_num_channels * output_width * output_height, sizeof(float));
+        if (!local_output) {
+            printf("Rank %d: Failed to allocate local pooling output buffer\n", world_rank);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+
     float scale = 1.0f / (pool_size * pool_size);
 
-    for (int c = 0; c < num_channels; c++) {
+    // Perform pooling only if there are channels assigned
+    for (int c = 0; c < local_num_channels; c++) {
+        int global_c = start_channel + c;
         for (int i = 0; i < output_height; i++) {
             for (int j = 0; j < output_width; j++) {
                 float sum = 0.0f;
@@ -199,19 +220,49 @@ void avg_pooling(float* input, int input_width, int input_height, int num_channe
                     for (int pj = 0; pj < pool_size; pj++) {
                         int in_i = i * pool_size + pi;
                         int in_j = j * pool_size + pj;
-                        sum += input[c * input_height * input_width +
-                                   in_i * input_width + in_j];
+                        int input_idx = global_c * input_height * input_width +
+                                        in_i * input_width + in_j;
+                        sum += input[input_idx];
                     }
                 }
-                output[c * output_height * output_width + 
-                      i * output_width + j] = sum * scale;
+                local_output[c * output_width * output_height +
+                            i * output_width + j] = sum * scale;
             }
         }
     }
 
-    double pool_end = MPI_Wtime();
+    // Prepare for gathering
+    int* recvcounts = NULL;
+    int* displs = NULL;
+
     if (world_rank == 0) {
-        printf("Pooling time: %.7f seconds\n", pool_end - pool_start);
+        recvcounts = (int*)malloc(world_size * sizeof(int));
+        displs = (int*)malloc(world_size * sizeof(int));
+        if (!recvcounts || !displs) {
+            printf("Rank %d: Failed to allocate recvcounts or displs\n", world_rank);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        int displacement = 0;
+        for (int i = 0; i < world_size; i++) {
+            int proc_channels = num_channels / world_size + (i < (num_channels % world_size) ? 1 : 0);
+            recvcounts[i] = proc_channels * output_width * output_height;
+            displs[i] = displacement;
+            displacement += recvcounts[i];
+        }
+    }
+
+    // Gather all local pooling outputs to the root process
+    MPI_Gatherv(local_output, (local_num_channels > 0) ? local_num_channels * output_width * output_height : 0, 
+                MPI_FLOAT,
+                (world_rank == 0) ? output : NULL, recvcounts, displs, MPI_FLOAT,
+                0, MPI_COMM_WORLD);
+
+    // Free allocated memory
+    if (local_output) free(local_output);
+    if (world_rank == 0) {
+        free(recvcounts);
+        free(displs);
     }
 }
 
@@ -219,7 +270,9 @@ void avg_pooling(float* input, int input_width, int input_height, int num_channe
 void softmax(float* input, int size) {
     float max_val = input[0];
     for (int i = 1; i < size; i++) {
-        if (input[i] > max_val) max_val = input[i];
+        if (input[i] > max_val) {
+            max_val = input[i];
+        }
     }
 
     float sum = 0.0f;
@@ -233,75 +286,176 @@ void softmax(float* input, int size) {
     }
 }
 
-// Dense layer operation with timing
-void dense(float* input, float* weights, float* bias,
-          int input_size, int output_size, float* output, int is_output) {
-    double dense_start = MPI_Wtime();
+// Parallel Dense layer operation with MPI
+void dense_mpi(float* input, float* weights, float* bias,
+               int input_size, int output_size, float* output, int is_output) {
 
-    for (int i = 0; i < output_size; i++) {
-        float sum = 0.0f;
-        for (int j = 0; j < input_size; j++) {
-            sum += input[j] * weights[j * output_size + i];
+    // Updated work distribution
+    int outputs_per_process = output_size / world_size + (world_rank < (output_size % world_size) ? 1 : 0);
+    int start_output = (world_rank * (output_size / world_size)) + 
+                       (world_rank < (output_size % world_size) ? world_rank : (output_size % world_size));
+    int local_output_size = outputs_per_process;
+
+    // Allocate local output buffer only if there are outputs to compute
+    float* local_output = NULL;
+    if (local_output_size > 0) {
+        local_output = (float*)malloc(local_output_size * sizeof(float));
+        if (!local_output) {
+            printf("Rank %d: Failed to allocate local output buffer for dense layer\n", world_rank);
+            MPI_Abort(MPI_COMM_WORLD, 1);
         }
-        sum += bias[i];
-        output[i] = is_output ? sum : tanh_activate(sum);
     }
 
-    if (is_output) {
+    // Compute local outputs only if there are outputs assigned
+    for (int i = 0; i < local_output_size; i++) {
+        int neuron = start_output + i;
+        float sum = 0.0f;
+        for (int j = 0; j < input_size; j++) {
+            sum += input[j] * weights[j * output_size + neuron];
+        }
+        sum += bias[neuron];
+        local_output[i] = is_output ? sum : tanh_activate(sum);
+    }
+
+    // Prepare for gathering
+    int* recvcounts = NULL;
+    int* displs = NULL;
+
+    if (world_rank == 0) {
+        recvcounts = (int*)malloc(world_size * sizeof(int));
+        displs = (int*)malloc(world_size * sizeof(int));
+        if (!recvcounts || !displs) {
+            printf("Rank %d: Failed to allocate recvcounts or displs\n", world_rank);
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+
+        int displacement = 0;
+        for (int i = 0; i < world_size; i++) {
+            int proc_outputs = output_size / world_size + (i < (output_size % world_size) ? 1 : 0);
+            recvcounts[i] = proc_outputs;
+            displs[i] = displacement;
+            displacement += recvcounts[i];
+        }
+    }
+
+    // Gather partial outputs
+    MPI_Gatherv(local_output, (local_output_size > 0) ? local_output_size : 0, MPI_FLOAT,
+                (world_rank == 0) ? output : NULL, recvcounts, displs, MPI_FLOAT,
+                0, MPI_COMM_WORLD);
+
+    // If this is the output layer and on root, perform softmax
+    if (is_output && world_rank == 0) {
         softmax(output, output_size);
     }
 
-    double dense_end = MPI_Wtime();
+    // Free allocated memory
+    if (local_output) free(local_output);
     if (world_rank == 0) {
-        printf("Dense layer time: %.7f seconds\n", dense_end - dense_start);
+        free(recvcounts);
+        free(displs);
     }
 }
 
-// Initialize network weights
+// Initialize network weights with optimized broadcasting
 NetworkWeights init_network() {
-    double init_start = MPI_Wtime();
     NetworkWeights weights;
 
-    // Load convolution layer 1 weights and rearrange
-    int conv1_weights_size = CONV1_FILTERS * INPUT_CHANNELS * CONV1_SIZE * CONV1_SIZE;
-    float* conv1_weights_raw = load_weights("conv2d_weight.txt", conv1_weights_size);
-    weights.conv1_weights = (float*)malloc(conv1_weights_size * sizeof(float));
-    rearrange_conv_weights(conv1_weights_raw, weights.conv1_weights,
-                          CONV1_SIZE, INPUT_CHANNELS, CONV1_FILTERS);
-    free(conv1_weights_raw);
+    // Allocate memory for all weight arrays on all processes
+    weights.conv1_weights = (float*)malloc(CONV1_FILTERS * INPUT_CHANNELS * CONV1_SIZE * CONV1_SIZE * sizeof(float));
+    weights.conv1_bias = (float*)malloc(CONV1_FILTERS * sizeof(float));
 
-    weights.conv1_bias = load_weights("conv2d_bias.txt", CONV1_FILTERS);
+    weights.conv2_weights = (float*)malloc(CONV2_FILTERS * CONV1_FILTERS * CONV2_SIZE * CONV2_SIZE * sizeof(float));
+    weights.conv2_bias = (float*)malloc(CONV2_FILTERS * sizeof(float));
 
-    // Load convolution layer 2 weights and rearrange
-    int conv2_weights_size = CONV2_FILTERS * CONV1_FILTERS * CONV2_SIZE * CONV2_SIZE;
-    float* conv2_weights_raw = load_weights("conv2d_1_weight.txt", conv2_weights_size);
-    weights.conv2_weights = (float*)malloc(conv2_weights_size * sizeof(float));
-    rearrange_conv_weights(conv2_weights_raw, weights.conv2_weights,
-                          CONV2_SIZE, CONV1_FILTERS, CONV2_FILTERS);
-    free(conv2_weights_raw);
+    weights.conv3_weights = (float*)malloc(CONV3_FILTERS * CONV2_FILTERS * CONV3_SIZE * CONV3_SIZE * sizeof(float));
+    weights.conv3_bias = (float*)malloc(CONV3_FILTERS * sizeof(float));
 
-    weights.conv2_bias = load_weights("conv2d_1_bias.txt", CONV2_FILTERS);
+    weights.fc1_weights = (float*)malloc(CONV3_FILTERS * FC1_SIZE * sizeof(float));
+    weights.fc1_bias = (float*)malloc(FC1_SIZE * sizeof(float));
 
-    // Load convolution layer 3 weights and rearrange
-    int conv3_weights_size = CONV3_FILTERS * CONV2_FILTERS * CONV3_SIZE * CONV3_SIZE;
-    float* conv3_weights_raw = load_weights("conv2d_2_weight.txt", conv3_weights_size);
-    weights.conv3_weights = (float*)malloc(conv3_weights_size * sizeof(float));
-    rearrange_conv_weights(conv3_weights_raw, weights.conv3_weights,
-                          CONV3_SIZE, CONV2_FILTERS, CONV3_FILTERS);
-    free(conv3_weights_raw);
+    weights.fc2_weights = (float*)malloc(FC1_SIZE * OUTPUT_SIZE * sizeof(float));
+    weights.fc2_bias = (float*)malloc(OUTPUT_SIZE * sizeof(float));
 
-    weights.conv3_bias = load_weights("conv2d_2_bias.txt", CONV3_FILTERS);
-
-    // Load dense layer weights
-    weights.fc1_weights = load_weights("dense_weight.txt", CONV3_FILTERS * FC1_SIZE);
-    weights.fc1_bias = load_weights("dense_bias.txt", FC1_SIZE);
-    weights.fc2_weights = load_weights("dense_1_weight.txt", FC1_SIZE * OUTPUT_SIZE);
-    weights.fc2_bias = load_weights("dense_1_bias.txt", OUTPUT_SIZE);
-
-    double init_end = MPI_Wtime();
-    if (world_rank == 0) {
-        printf("Network initialization time: %.7f seconds\n", init_end - init_start);
+    if (!weights.conv1_weights || !weights.conv1_bias ||
+        !weights.conv2_weights || !weights.conv2_bias ||
+        !weights.conv3_weights || !weights.conv3_bias ||
+        !weights.fc1_weights || !weights.fc1_bias ||
+        !weights.fc2_weights || !weights.fc2_bias) {
+        printf("Rank %d: Failed to allocate memory for network weights\n", world_rank);
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
+
+    if (world_rank == 0) {
+        // Load convolution layer 1 weights and rearrange
+        int conv1_weights_size = CONV1_FILTERS * INPUT_CHANNELS * CONV1_SIZE * CONV1_SIZE;
+        float* conv1_weights_raw = load_weights("conv2d_weight.txt", conv1_weights_size);
+        rearrange_conv_weights(conv1_weights_raw, weights.conv1_weights,
+                              CONV1_SIZE, INPUT_CHANNELS, CONV1_FILTERS);
+        free(conv1_weights_raw);
+
+        float* temp_conv1_bias = load_weights("conv2d_bias.txt", CONV1_FILTERS);
+        memcpy(weights.conv1_bias, temp_conv1_bias, CONV1_FILTERS * sizeof(float));
+        free(temp_conv1_bias);
+
+        // Load convolution layer 2 weights and rearrange
+        int conv2_weights_size = CONV2_FILTERS * CONV1_FILTERS * CONV2_SIZE * CONV2_SIZE;
+        float* conv2_weights_raw = load_weights("conv2d_1_weight.txt", conv2_weights_size);
+        rearrange_conv_weights(conv2_weights_raw, weights.conv2_weights,
+                              CONV2_SIZE, CONV1_FILTERS, CONV2_FILTERS);
+        free(conv2_weights_raw);
+
+        float* temp_conv2_bias = load_weights("conv2d_1_bias.txt", CONV2_FILTERS);
+        memcpy(weights.conv2_bias, temp_conv2_bias, CONV2_FILTERS * sizeof(float));
+        free(temp_conv2_bias);
+
+        // Load convolution layer 3 weights and rearrange
+        int conv3_weights_size = CONV3_FILTERS * CONV2_FILTERS * CONV3_SIZE * CONV3_SIZE;
+        float* conv3_weights_raw = load_weights("conv2d_2_weight.txt", conv3_weights_size);
+        rearrange_conv_weights(conv3_weights_raw, weights.conv3_weights,
+                              CONV3_SIZE, CONV2_FILTERS, CONV3_FILTERS);
+        free(conv3_weights_raw);
+
+        float* temp_conv3_bias = load_weights("conv2d_2_bias.txt", CONV3_FILTERS);
+        memcpy(weights.conv3_bias, temp_conv3_bias, CONV3_FILTERS * sizeof(float));
+        free(temp_conv3_bias);
+
+        // Load dense layer weights
+        float* temp_fc1_weights = load_weights("dense_weight.txt", CONV3_FILTERS * FC1_SIZE);
+        memcpy(weights.fc1_weights, temp_fc1_weights, CONV3_FILTERS * FC1_SIZE * sizeof(float));
+        free(temp_fc1_weights);
+
+        float* temp_fc1_bias = load_weights("dense_bias.txt", FC1_SIZE);
+        memcpy(weights.fc1_bias, temp_fc1_bias, FC1_SIZE * sizeof(float));
+        free(temp_fc1_bias);
+
+        float* temp_fc2_weights = load_weights("dense_1_weight.txt", FC1_SIZE * OUTPUT_SIZE);
+        memcpy(weights.fc2_weights, temp_fc2_weights, FC1_SIZE * OUTPUT_SIZE * sizeof(float));
+        free(temp_fc2_weights);
+
+        float* temp_fc2_bias = load_weights("dense_1_bias.txt", OUTPUT_SIZE);
+        memcpy(weights.fc2_bias, temp_fc2_bias, OUTPUT_SIZE * sizeof(float));
+        free(temp_fc2_bias);
+    }
+
+    // Broadcast all weights and biases from root to all processes
+    MPI_Bcast(weights.conv1_weights, CONV1_FILTERS * INPUT_CHANNELS * CONV1_SIZE * CONV1_SIZE, 
+              MPI_FLOAT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(weights.conv1_bias, CONV1_FILTERS, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    MPI_Bcast(weights.conv2_weights, CONV2_FILTERS * CONV1_FILTERS * CONV2_SIZE * CONV2_SIZE,
+              MPI_FLOAT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(weights.conv2_bias, CONV2_FILTERS, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    MPI_Bcast(weights.conv3_weights, CONV3_FILTERS * CONV2_FILTERS * CONV3_SIZE * CONV3_SIZE,
+              MPI_FLOAT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(weights.conv3_bias, CONV3_FILTERS, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    MPI_Bcast(weights.fc1_weights, CONV3_FILTERS * FC1_SIZE, MPI_FLOAT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(weights.fc1_bias, FC1_SIZE, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    MPI_Bcast(weights.fc2_weights, FC1_SIZE * OUTPUT_SIZE, MPI_FLOAT, 0, MPI_COMM_WORLD);
+    MPI_Bcast(weights.fc2_bias, OUTPUT_SIZE, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
 
     return weights;
 }
@@ -320,132 +474,124 @@ void free_network(NetworkWeights* weights) {
     free(weights->fc2_bias);
 }
 
-// Forward pass through the network with MPI parallelization and timing
+// Forward pass through the network with MPI parallelization
 void forward_mpi(float* input, float* output, NetworkWeights* weights) {
     double total_start = MPI_Wtime();
 
-    // Allocate memory on all processes
-    int input_size = INPUT_WIDTH * INPUT_HEIGHT * INPUT_CHANNELS;
-    float* local_input = NULL;
-    
-    if (world_rank == 0) {
-        local_input = input;
-    } else {
-        local_input = (float*)malloc(input_size * sizeof(float));
-        if (!local_input) {
-            printf("Rank %d: Failed to allocate local input buffer\n", world_rank);
-            MPI_Abort(MPI_COMM_WORLD, 1);
-            return;
-        }
-    }
-
-    // Broadcast weights to all processes first
-    MPI_Bcast(weights->conv1_weights, CONV1_FILTERS * INPUT_CHANNELS * CONV1_SIZE * CONV1_SIZE, 
-              MPI_FLOAT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(weights->conv1_bias, CONV1_FILTERS, MPI_FLOAT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(weights->conv2_weights, CONV2_FILTERS * CONV1_FILTERS * CONV2_SIZE * CONV2_SIZE,
-              MPI_FLOAT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(weights->conv2_bias, CONV2_FILTERS, MPI_FLOAT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(weights->conv3_weights, CONV3_FILTERS * CONV2_FILTERS * CONV3_SIZE * CONV3_SIZE,
-              MPI_FLOAT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(weights->conv3_bias, CONV3_FILTERS, MPI_FLOAT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(weights->fc1_weights, CONV3_FILTERS * FC1_SIZE, MPI_FLOAT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(weights->fc1_bias, FC1_SIZE, MPI_FLOAT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(weights->fc2_weights, FC1_SIZE * OUTPUT_SIZE, MPI_FLOAT, 0, MPI_COMM_WORLD);
-    MPI_Bcast(weights->fc2_bias, OUTPUT_SIZE, MPI_FLOAT, 0, MPI_COMM_WORLD);
-
-    // Broadcast input data
-    MPI_Barrier(MPI_COMM_WORLD);
-    if (world_rank == 0) {
-        printf("Broadcasting input data...\n");
-    }
-    MPI_Bcast(local_input, input_size, MPI_FLOAT, 0, MPI_COMM_WORLD);
-
-    // Allocate intermediate buffers with error checking
-    float* conv1_output = (float*)calloc(CONV1_FILTERS * CONV1_OUTPUT * CONV1_OUTPUT, sizeof(float));
-    float* pool1_output = (float*)calloc(CONV1_FILTERS * POOL1_OUTPUT * POOL1_OUTPUT, sizeof(float));
-    float* conv2_output = (float*)calloc(CONV2_FILTERS * CONV2_OUTPUT * CONV2_OUTPUT, sizeof(float));
-    float* pool2_output = (float*)calloc(CONV2_FILTERS * POOL2_OUTPUT * POOL2_OUTPUT, sizeof(float));
-    float* conv3_output = (float*)calloc(CONV3_FILTERS * CONV3_OUTPUT * CONV3_OUTPUT, sizeof(float));
-    float* fc1_output = (float*)calloc(FC1_SIZE, sizeof(float));
+    // Allocate intermediate buffers on all processes
+    float* conv1_output = (float*)malloc(CONV1_FILTERS * CONV1_OUTPUT * CONV1_OUTPUT * sizeof(float));
+    float* pool1_output = (float*)malloc(CONV1_FILTERS * POOL1_OUTPUT * POOL1_OUTPUT * sizeof(float));
+    float* conv2_output = (float*)malloc(CONV2_FILTERS * CONV2_OUTPUT * CONV2_OUTPUT * sizeof(float));
+    float* pool2_output = (float*)malloc(CONV2_FILTERS * POOL2_OUTPUT * POOL2_OUTPUT * sizeof(float));
+    float* conv3_output = (float*)malloc(CONV3_FILTERS * CONV3_OUTPUT * CONV3_OUTPUT * sizeof(float));
+    float* fc1_output = (float*)malloc(FC1_SIZE * sizeof(float));
 
     if (!conv1_output || !pool1_output || !conv2_output || 
         !pool2_output || !conv3_output || !fc1_output) {
         printf("Rank %d: Failed to allocate intermediate buffers\n", world_rank);
         MPI_Abort(MPI_COMM_WORLD, 1);
-        return;
     }
 
-    // Conv1 layer
-    if (world_rank == 0) printf("\nStarting Conv1 layer...\n");
+    // Broadcast input data
     MPI_Barrier(MPI_COMM_WORLD);
-    convolution_mpi(local_input, INPUT_WIDTH, INPUT_HEIGHT, INPUT_CHANNELS,
+    MPI_Bcast(input, INPUT_WIDTH * INPUT_HEIGHT * INPUT_CHANNELS, MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    // Conv1 layer
+    double conv1_start = MPI_Wtime();
+    convolution_mpi(input, INPUT_WIDTH, INPUT_HEIGHT, INPUT_CHANNELS,
                    weights->conv1_weights, weights->conv1_bias,
                    CONV1_SIZE, CONV1_FILTERS,
                    conv1_output, CONV1_OUTPUT, CONV1_OUTPUT);
+    double conv1_end = MPI_Wtime();
+    if (world_rank == 0) {
+        printf("Conv1 layer time: %.7f seconds\n", conv1_end - conv1_start);
+    }
+
+    // Broadcast conv1_output to all processes
+    MPI_Bcast(conv1_output, CONV1_FILTERS * CONV1_OUTPUT * CONV1_OUTPUT, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
     // Pool1 layer
-    if (world_rank == 0) printf("\nStarting Pool1 layer...\n");
+    double pool1_start = MPI_Wtime();
+    pooling_mpi(conv1_output, CONV1_OUTPUT, CONV1_OUTPUT, CONV1_FILTERS,
+               POOL1_SIZE, pool1_output, POOL1_OUTPUT, POOL1_OUTPUT);
+    double pool1_end = MPI_Wtime();
     if (world_rank == 0) {
-        avg_pooling(conv1_output, CONV1_OUTPUT, CONV1_OUTPUT, CONV1_FILTERS,
-                   POOL1_SIZE, pool1_output, POOL1_OUTPUT, POOL1_OUTPUT);
+        printf("Pool1 layer time: %.7f seconds\n", pool1_end - pool1_start);
     }
-    MPI_Barrier(MPI_COMM_WORLD);
-    MPI_Bcast(pool1_output, CONV1_FILTERS * POOL1_OUTPUT * POOL1_OUTPUT,
-              MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    // Broadcast pool1_output to all processes
+    MPI_Bcast(pool1_output, CONV1_FILTERS * POOL1_OUTPUT * POOL1_OUTPUT, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
     // Conv2 layer
-    if (world_rank == 0) printf("\nStarting Conv2 layer...\n");
-    MPI_Barrier(MPI_COMM_WORLD);
+    double conv2_start = MPI_Wtime();
     convolution_mpi(pool1_output, POOL1_OUTPUT, POOL1_OUTPUT, CONV1_FILTERS,
                    weights->conv2_weights, weights->conv2_bias,
                    CONV2_SIZE, CONV2_FILTERS,
                    conv2_output, CONV2_OUTPUT, CONV2_OUTPUT);
+    double conv2_end = MPI_Wtime();
+    if (world_rank == 0) {
+        printf("Conv2 layer time: %.7f seconds\n", conv2_end - conv2_start);
+    }
+
+    // Broadcast conv2_output to all processes
+    MPI_Bcast(conv2_output, CONV2_FILTERS * CONV2_OUTPUT * CONV2_OUTPUT, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
     // Pool2 layer
-    if (world_rank == 0) printf("\nStarting Pool2 layer...\n");
+    double pool2_start = MPI_Wtime();
+    pooling_mpi(conv2_output, CONV2_OUTPUT, CONV2_OUTPUT, CONV2_FILTERS,
+               POOL2_SIZE, pool2_output, POOL2_OUTPUT, POOL2_OUTPUT);
+    double pool2_end = MPI_Wtime();
     if (world_rank == 0) {
-        avg_pooling(conv2_output, CONV2_OUTPUT, CONV2_OUTPUT, CONV2_FILTERS,
-                   POOL2_SIZE, pool2_output, POOL2_OUTPUT, POOL2_OUTPUT);
+        printf("Pool2 layer time: %.7f seconds\n", pool2_end - pool2_start);
     }
-    MPI_Barrier(MPI_COMM_WORLD);
-    MPI_Bcast(pool2_output, CONV2_FILTERS * POOL2_OUTPUT * POOL2_OUTPUT,
-              MPI_FLOAT, 0, MPI_COMM_WORLD);
+
+    // Broadcast pool2_output to all processes
+    MPI_Bcast(pool2_output, CONV2_FILTERS * POOL2_OUTPUT * POOL2_OUTPUT, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
     // Conv3 layer
-    if (world_rank == 0) printf("\nStarting Conv3 layer...\n");
-    MPI_Barrier(MPI_COMM_WORLD);
+    double conv3_start = MPI_Wtime();
     convolution_mpi(pool2_output, POOL2_OUTPUT, POOL2_OUTPUT, CONV2_FILTERS,
                    weights->conv3_weights, weights->conv3_bias,
                    CONV3_SIZE, CONV3_FILTERS,
                    conv3_output, CONV3_OUTPUT, CONV3_OUTPUT);
+    double conv3_end = MPI_Wtime();
+    if (world_rank == 0) {
+        printf("Conv3 layer time: %.7f seconds\n", conv3_end - conv3_start);
+    }
+
+    // Broadcast conv3_output to all processes
+    MPI_Bcast(conv3_output, CONV3_FILTERS * CONV3_OUTPUT * CONV3_OUTPUT, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
     // FC1 layer
-    if (world_rank == 0) printf("\nStarting FC1 layer...\n");
+    double fc1_start = MPI_Wtime();
+    dense_mpi(conv3_output, weights->fc1_weights, weights->fc1_bias,
+             CONV3_FILTERS, FC1_SIZE, fc1_output, 0);
+    double fc1_end = MPI_Wtime();
     if (world_rank == 0) {
-        dense(conv3_output, weights->fc1_weights, weights->fc1_bias,
-              CONV3_FILTERS, FC1_SIZE, fc1_output, 0);
+        printf("FC1 layer time: %.7f seconds\n", fc1_end - fc1_start);
     }
-    MPI_Barrier(MPI_COMM_WORLD);
+
+    // Broadcast fc1_output to all processes
     MPI_Bcast(fc1_output, FC1_SIZE, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
     // FC2 layer (output)
-    if (world_rank == 0) printf("\nStarting FC2 layer...\n");
+    double fc2_start = MPI_Wtime();
+    dense_mpi(fc1_output, weights->fc2_weights, weights->fc2_bias,
+             FC1_SIZE, OUTPUT_SIZE, output, 1);
+    double fc2_end = MPI_Wtime();
     if (world_rank == 0) {
-        dense(fc1_output, weights->fc2_weights, weights->fc2_bias,
-              FC1_SIZE, OUTPUT_SIZE, output, 1);
+        printf("FC2 layer time: %.7f seconds\n", fc2_end - fc2_start);
     }
+
+    // Broadcast output to all processes
     MPI_Bcast(output, OUTPUT_SIZE, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
     double total_end = MPI_Wtime();
     if (world_rank == 0) {
-        printf("\nTotal network execution time: %.7f seconds\n", total_end - total_start);
+        printf("Total network execution time: %.7f seconds\n", total_end - total_start);
     }
 
     // Cleanup
-    if (world_rank != 0) {
-        free(local_input);
-    }
     free(conv1_output);
     free(pool1_output);
     free(conv2_output);
@@ -458,24 +604,24 @@ void forward_mpi(float* input, float* output, NetworkWeights* weights) {
 float* read_image(const char* filename) {
     float* image = (float*)malloc(INPUT_WIDTH * INPUT_HEIGHT * INPUT_CHANNELS * sizeof(float));
     if (!image) {
-        printf("Failed to allocate memory for image\n");
-        return NULL;
+        printf("Rank %d: Failed to allocate memory for image\n", world_rank);
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
     FILE* fp = fopen(filename, "rb");
     if (!fp) {
-        printf("Error opening image file: %s\n", filename);
+        printf("Rank %d: Error opening image file: %s\n", world_rank, filename);
         free(image);
-        return NULL;
+        MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
     unsigned char pixel;
     for (int i = 0; i < INPUT_WIDTH * INPUT_HEIGHT * INPUT_CHANNELS; i++) {
         if (fread(&pixel, 1, 1, fp) != 1) {
-            printf("Error reading image data\n");
+            printf("Rank %d: Error reading image data at index %d\n", world_rank, i);
             fclose(fp);
             free(image);
-            return NULL;
+            MPI_Abort(MPI_COMM_WORLD, 1);
         }
         image[i] = (float)pixel / 255.0f;
     }
@@ -503,20 +649,18 @@ int main(int argc, char** argv) {
     float* output = NULL;
 
     // Initialize network weights on all processes
-    if (world_rank == 0) {
-        printf("Initializing network...\n");
-    }
     weights = init_network();
     MPI_Barrier(MPI_COMM_WORLD);
 
     // Root process reads input
     if (world_rank == 0) {
-        printf("Reading input image...\n");
         input = read_image("test_images/digit_6.raw");
+    } else {
+        // Non-root processes allocate memory for input
+        input = (float*)malloc(INPUT_WIDTH * INPUT_HEIGHT * INPUT_CHANNELS * sizeof(float));
         if (!input) {
-            printf("Failed to read input image\n");
+            printf("Rank %d: Failed to allocate input buffer\n", world_rank);
             MPI_Abort(MPI_COMM_WORLD, 1);
-            return 1;
         }
     }
 
@@ -525,13 +669,11 @@ int main(int argc, char** argv) {
     if (!output) {
         printf("Rank %d: Failed to allocate output buffer\n", world_rank);
         MPI_Abort(MPI_COMM_WORLD, 1);
-        return 1;
     }
 
     // Synchronize before starting computation
     MPI_Barrier(MPI_COMM_WORLD);
 
-    if (world_rank == 0) printf("Starting forward pass...\n");
     forward_mpi(input, output, &weights);
 
     // Print results only on root process
@@ -552,11 +694,12 @@ int main(int argc, char** argv) {
         for (int i = 0; i < OUTPUT_SIZE; i++) {
             printf("Digit %d: %.2f%%\n", i, output[i] * 100);
         }
-
     }
 
     // Cleanup
     if (world_rank == 0) {
+        free(input);
+    } else {
         free(input);
     }
     free(output);
